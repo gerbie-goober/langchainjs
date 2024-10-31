@@ -1,15 +1,17 @@
 import { v4 as uuidv4 } from "uuid";
+import { Mistral as MistralClient } from "@mistralai/mistralai";
 import {
-  ChatCompletionResponse,
-  Function as MistralAIFunction,
-  ToolCalls as MistralAIToolCalls,
-  ResponseFormat,
-  ChatCompletionResponseChunk,
-  ChatRequest,
-  Tool as MistralAITool,
-  Message as MistralAIMessage,
-  TokenUsage as MistralAITokenUsage,
-} from "@mistralai/mistralai";
+  ChatCompletionRequest as MistralAIChatCompletionRequest,
+  ChatCompletionRequestToolChoice as MistralAIToolChoice,
+  Messages as MistralAIMessage,
+} from "@mistralai/mistralai/models/components/chatcompletionrequest.js";
+import { ContentChunk } from "@mistralai/mistralai/models/components/contentchunk.js";
+import { Tool as MistralAITool } from "@mistralai/mistralai/models/components/tool.js";
+import { ToolCall as MistralAIToolCall } from "@mistralai/mistralai/models/components/toolcall.js";
+import { ChatCompletionStreamRequest as MistralChatCompletionStreamRequest } from "@mistralai/mistralai/models/components/chatcompletionstreamrequest.js";
+import { UsageInfo as MistralAITokenUsage } from "@mistralai/mistralai/models/components/usageinfo.js";
+import { CompletionEvent as MistralAIChatCompletionEvent } from "@mistralai/mistralai/models/components/completionevent.js";
+import { ChatCompletionResponse as MistralChatCompletionResponse } from "@mistralai/mistralai/models/components/chatcompletionresponse.js";
 import {
   MessageType,
   type BaseMessage,
@@ -73,14 +75,7 @@ interface TokenUsage {
   totalTokens?: number;
 }
 
-export type MistralAIToolChoice = "auto" | "any" | "none";
-
-type MistralAIToolInput = { type: string; function: MistralAIFunction };
-
-type ChatMistralAIToolType =
-  | MistralAIToolInput
-  | MistralAITool
-  | BindToolsInput;
+type ChatMistralAIToolType = MistralAIToolCall | MistralAITool | BindToolsInput;
 
 export interface ChatMistralAICallOptions
   extends Omit<BaseLanguageModelCallOptions, "stop"> {
@@ -119,9 +114,9 @@ export interface ChatMistralAIInput
    */
   model?: string;
   /**
-   * Override the default endpoint.
+   * Override the default server URL used by the Mistral SDK.
    */
-  endpoint?: string;
+  serverURL?: string;
   /**
    * What sampling temperature to use, between 0.0 and 2.0.
    * Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
@@ -187,12 +182,59 @@ function convertMessagesToMistralMessages(
     }
   };
 
-  const getContent = (content: MessageContent): string => {
+  const getContent = (content: MessageContent, role: MessageType): string | ContentChunk[] => {
+    const mistralRole = getRole(role)
+
     if (typeof content === "string") {
       return content;
     }
+    else if (Array.isArray(content)) {
+      if (mistralRole === "user") {
+        return content.map((messageContentComplex) => {
+          if (messageContentComplex?.type === "image_url") {
+            return {
+              type: messageContentComplex.type,
+              imageUrl: messageContentComplex?.image_url
+            } as ContentChunk;
+          }
+          else if (messageContentComplex?.type === "text"){
+            return {
+              type: messageContentComplex.type,
+              text: messageContentComplex?.text
+            } as ContentChunk;
+          }
+          throw new Error(
+            `ChatMistralAI only supports messages of type MessageContentText
+              and MessageContentImageUrl for role "human". Received: ${JSON.stringify(
+              content,
+              null,
+              2
+            )}`
+          );
+        });
+      }
+      else if (mistralRole === "system") {
+        return content.map((messageContentComplex) => {
+          if (messageContentComplex?.type === "text"){
+            return {
+              type: messageContentComplex.type,
+              text: messageContentComplex?.text
+            } as ContentChunk;
+          }
+          throw new Error(
+            `ChatMistralAI only supports messages of type MessageContentText
+              for role "system". Received: ${JSON.stringify(
+              content,
+              null,
+              2
+            )}`
+          );
+        });
+      }
+    }
     throw new Error(
-      `ChatMistralAI does not support non text message content. Received: ${JSON.stringify(
+      `ChatMistralAI does not support non text message content for role "ai", "tool", 
+        or "function". Received: ${JSON.stringify(
         content,
         null,
         2
@@ -200,14 +242,14 @@ function convertMessagesToMistralMessages(
     );
   };
 
-  const getTools = (message: BaseMessage): MistralAIToolCalls[] | undefined => {
+  const getTools = (message: BaseMessage): MistralAIToolCall[] | undefined => {
     if (isAIMessage(message) && !!message.tool_calls?.length) {
       return message.tool_calls
         .map((toolCall) => ({
           ...toolCall,
           id: _convertToolCallIdToMistralCompatible(toolCall.id ?? ""),
         }))
-        .map(convertLangChainToolCallToOpenAI) as MistralAIToolCalls[];
+        .map(convertLangChainToolCallToOpenAI) as MistralAIToolCall[];
     }
     if (!message.additional_kwargs.tool_calls?.length) {
       return undefined;
@@ -223,37 +265,46 @@ function convertMessagesToMistralMessages(
 
   return messages.map((message) => {
     const toolCalls = getTools(message);
-    const content = toolCalls === undefined ? getContent(message.content) : "";
+    const content = getContent(message.content, message._getType());
     if ("tool_call_id" in message && typeof message.tool_call_id === "string") {
       return {
         role: getRole(message._getType()),
         content,
         name: message.name,
-        tool_call_id: _convertToolCallIdToMistralCompatible(
+        toolCallId: _convertToolCallIdToMistralCompatible(
           message.tool_call_id
         ),
+      };
+    }
+    else if (isAIMessage(message)) {
+      return {
+        role: getRole(message._getType()),
+        content,
+        toolCalls: toolCalls,
       };
     }
 
     return {
       role: getRole(message._getType()),
       content,
-      tool_calls: toolCalls,
     };
   }) as MistralAIMessage[];
 }
 
 function mistralAIResponseToChatMessage(
-  choice: ChatCompletionResponse["choices"][0],
+  choice: NonNullable<MistralChatCompletionResponse["choices"]>[0],
   usage?: MistralAITokenUsage
 ): BaseMessage {
   const { message } = choice;
+  if (message === undefined) {
+    throw new Error("No message found in response");
+  }
   // MistralAI SDK does not include tool_calls in the non
   // streaming return type, so we need to extract it like this
   // to satisfy typescript.
-  let rawToolCalls: MistralAIToolCalls[] = [];
+  let rawToolCalls: MistralAIToolCall[] = [];
   if ("tool_calls" in message && Array.isArray(message.tool_calls)) {
-    rawToolCalls = message.tool_calls as MistralAIToolCalls[];
+    rawToolCalls = message.tool_calls as MistralAIToolCall[];
   }
   switch (message.role) {
     case "assistant": {
@@ -275,19 +326,12 @@ function mistralAIResponseToChatMessage(
         content: message.content ?? "",
         tool_calls: toolCalls,
         invalid_tool_calls: invalidToolCalls,
-        additional_kwargs: {
-          tool_calls: rawToolCalls.length
-            ? rawToolCalls.map((toolCall) => ({
-                ...toolCall,
-                type: "function",
-              }))
-            : undefined,
-        },
+        additional_kwargs: {},
         usage_metadata: usage
           ? {
-              input_tokens: usage.prompt_tokens,
-              output_tokens: usage.completion_tokens,
-              total_tokens: usage.total_tokens,
+              input_tokens: usage.promptTokens,
+              output_tokens: usage.completionTokens,
+              total_tokens: usage.totalTokens,
             }
           : undefined,
       });
@@ -300,8 +344,8 @@ function mistralAIResponseToChatMessage(
 function _convertDeltaToMessageChunk(
   delta: {
     role?: string | undefined;
-    content?: string | undefined;
-    tool_calls?: MistralAIToolCalls[] | undefined;
+    content?: string | null | undefined;
+    tool_calls?: MistralAIToolCall[] | null | undefined;
   },
   usage?: MistralAITokenUsage | null
 ) {
@@ -311,9 +355,9 @@ function _convertDeltaToMessageChunk(
         content: "",
         usage_metadata: usage
           ? {
-              input_tokens: usage.prompt_tokens,
-              output_tokens: usage.completion_tokens,
-              total_tokens: usage.total_tokens,
+              input_tokens: usage.promptTokens,
+              output_tokens: usage.completionTokens,
+              total_tokens: usage.totalTokens,
             }
           : undefined,
       });
@@ -325,7 +369,7 @@ function _convertDeltaToMessageChunk(
   // need to insert it here.
   const rawToolCallChunksWithIndex = delta.tool_calls?.length
     ? delta.tool_calls?.map(
-        (toolCall, index): OpenAIToolCall => ({
+        (toolCall, index): MistralAIToolCall & { index: number } => ({
           ...toolCall,
           index,
           id: toolCall.id ?? uuidv4().replace(/-/g, ""),
@@ -342,13 +386,15 @@ function _convertDeltaToMessageChunk(
   let additional_kwargs;
   const toolCallChunks: ToolCallChunk[] = [];
   if (rawToolCallChunksWithIndex !== undefined) {
-    additional_kwargs = {
-      tool_calls: rawToolCallChunksWithIndex,
-    };
     for (const rawToolCallChunk of rawToolCallChunksWithIndex) {
+      const rawArgs = rawToolCallChunk.function?.arguments;
+      const args =
+        rawArgs === undefined || typeof rawArgs === "string"
+          ? rawArgs
+          : JSON.stringify(rawArgs);
       toolCallChunks.push({
         name: rawToolCallChunk.function?.name,
-        args: rawToolCallChunk.function?.arguments,
+        args,
         id: rawToolCallChunk.id,
         index: rawToolCallChunk.index,
         type: "tool_call_chunk",
@@ -367,9 +413,9 @@ function _convertDeltaToMessageChunk(
       additional_kwargs,
       usage_metadata: usage
         ? {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
+            input_tokens: usage.promptTokens,
+            output_tokens: usage.completionTokens,
+            total_tokens: usage.totalTokens,
           }
         : undefined,
     });
@@ -754,7 +800,7 @@ export class ChatMistralAI<
 
   apiKey: string;
 
-  endpoint?: string;
+  serverURL?: string;
 
   temperature = 0.7;
 
@@ -789,11 +835,10 @@ export class ChatMistralAI<
     }
     this.apiKey = apiKey;
     this.streaming = fields?.streaming ?? this.streaming;
-    this.endpoint = fields?.endpoint;
+    this.serverURL = fields?.serverURL;
     this.temperature = fields?.temperature ?? this.temperature;
     this.topP = fields?.topP ?? this.topP;
     this.maxTokens = fields?.maxTokens ?? this.maxTokens;
-    this.safeMode = fields?.safeMode ?? this.safeMode;
     this.safePrompt = fields?.safePrompt ?? this.safePrompt;
     this.randomSeed = fields?.seed ?? fields?.randomSeed ?? this.seed;
     this.seed = this.randomSeed;
@@ -834,22 +879,21 @@ export class ChatMistralAI<
    */
   invocationParams(
     options?: this["ParsedCallOptions"]
-  ): Omit<ChatRequest, "messages"> {
+  ): Omit<MistralAIChatCompletionRequest, "messages"> {
     const { response_format, tools, tool_choice } = options ?? {};
     const mistralAITools: Array<MistralAITool> | undefined = tools?.length
       ? _convertToolToMistralTool(tools)
       : undefined;
-    const params: Omit<ChatRequest, "messages"> = {
+    const params: Omit<MistralAIChatCompletionRequest, "messages"> = {
       model: this.model,
       tools: mistralAITools,
       temperature: this.temperature,
       maxTokens: this.maxTokens,
       topP: this.topP,
       randomSeed: this.seed,
-      safeMode: this.safeMode,
       safePrompt: this.safePrompt,
       toolChoice: tool_choice,
-      responseFormat: response_format as ResponseFormat,
+      responseFormat: response_format,
     };
     return params;
   }
@@ -870,38 +914,45 @@ export class ChatMistralAI<
    * @returns {Promise<MistralAIChatCompletionResult | AsyncGenerator<MistralAIChatCompletionResult>>} The response from the MistralAI API.
    */
   async completionWithRetry(
-    input: ChatRequest,
+    input: MistralChatCompletionStreamRequest,
     streaming: true
-  ): Promise<AsyncGenerator<ChatCompletionResponseChunk>>;
+  ): Promise<AsyncIterable<MistralAIChatCompletionEvent>>;
 
   async completionWithRetry(
-    input: ChatRequest,
+    input: MistralAIChatCompletionRequest,
     streaming: false
-  ): Promise<ChatCompletionResponse>;
+  ): Promise<MistralChatCompletionResponse>;
 
   async completionWithRetry(
-    input: ChatRequest,
+    input: MistralAIChatCompletionRequest | MistralChatCompletionStreamRequest,
     streaming: boolean
   ): Promise<
-    ChatCompletionResponse | AsyncGenerator<ChatCompletionResponseChunk>
+    MistralChatCompletionResponse | AsyncIterable<MistralAIChatCompletionEvent>
   > {
-    const { MistralClient } = await this.imports();
-    const client = new MistralClient(this.apiKey, this.endpoint);
+    const client = new MistralClient({
+      apiKey: this.apiKey,
+      serverURL: this.serverURL,
+    });
 
     return this.caller.call(async () => {
       try {
         let res:
-          | ChatCompletionResponse
-          | AsyncGenerator<ChatCompletionResponseChunk>;
+          | MistralChatCompletionResponse
+          | AsyncIterable<MistralAIChatCompletionEvent>;
         if (streaming) {
-          res = client.chatStream(input);
+          res = await client.chat.stream(input);
         } else {
-          res = await client.chat(input);
+          res = await client.chat.complete(input);
         }
         return res;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } catch (e: any) {
-        if (e.message?.includes("status: 400")) {
+        console.log(e, e.status, e.code, e.statusCode, e.message);
+        if (
+          e.message?.includes("status: 400") ||
+          e.message?.toLowerCase().includes("status 400") ||
+          e.message?.includes("validation failed")
+        ) {
           e.status = 400;
         }
         throw e;
@@ -925,7 +976,7 @@ export class ChatMistralAI<
 
     // Enable streaming for signal controller or timeout due
     // to SDK limitations on canceling requests.
-    const shouldStream = !!options.signal ?? !!options.timeout;
+    const shouldStream = options.signal ?? !!options.timeout;
 
     // Handle streaming
     if (this.streaming || shouldStream) {
@@ -950,11 +1001,8 @@ export class ChatMistralAI<
     // Not streaming, so we can just call the API once.
     const response = await this.completionWithRetry(input, false);
 
-    const {
-      completion_tokens: completionTokens,
-      prompt_tokens: promptTokens,
-      total_tokens: totalTokens,
-    } = response?.usage ?? {};
+    const { completionTokens, promptTokens, totalTokens } =
+      response?.usage ?? {};
 
     if (completionTokens) {
       tokenUsage.completionTokens =
@@ -982,8 +1030,8 @@ export class ChatMistralAI<
         text,
         message: mistralAIResponseToChatMessage(part, response?.usage),
       };
-      if (part.finish_reason) {
-        generation.generationInfo = { finish_reason: part.finish_reason };
+      if (part.finishReason) {
+        generation.generationInfo = { finishReason: part.finishReason };
       }
       generations.push(generation);
     }
@@ -1006,7 +1054,7 @@ export class ChatMistralAI<
     };
 
     const streamIterable = await this.completionWithRetry(input, true);
-    for await (const data of streamIterable) {
+    for await (const { data } of streamIterable) {
       if (options.signal?.aborted) {
         throw new Error("AbortError");
       }
@@ -1053,7 +1101,7 @@ export class ChatMistralAI<
   /** @ignore */
   _combineLLMOutput() {
     return [];
-  }
+  } 
 
   withStructuredOutput<
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1204,12 +1252,6 @@ export class ChatMistralAI<
       },
       parsedWithFallback,
     ]);
-  }
-
-  /** @ignore */
-  private async imports() {
-    const { default: MistralClient } = await import("@mistralai/mistralai");
-    return { MistralClient };
   }
 }
 
