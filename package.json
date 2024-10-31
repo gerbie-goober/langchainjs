@@ -69,5 +69,9 @@
       "eslint --cache --fix"
     ],
     "*.md": "prettier --config .prettierrc --write"
+  },
+  "dependencies": {
+    "@mistralai/mistralai": "^1.1.0",
+    "zod": "^3.23.8"
   }
 }

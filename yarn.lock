@@ -13098,6 +13098,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@mistralai/mistralai@npm:^1.1.0":
+  version: 1.1.0
+  resolution: "@mistralai/mistralai@npm:1.1.0"
+  peerDependencies:
+    zod: ">= 3"
+  checksum: 219a96ec73361f7c9079d8ed77a504bea767fba7e150159d6c7ec1019b5a0a76eaf0a867b5562442ed5face483a2b7c24f597bde56ecf7b39aece3b36831ce79
+  languageName: node
+  linkType: hard
+
 "@mixedbread-ai/sdk@npm:^2.2.3":
   version: 2.2.6
   resolution: "@mixedbread-ai/sdk@npm:2.2.6"
@@ -32987,6 +32996,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "langchainjs@workspace:."
   dependencies:
+    "@mistralai/mistralai": ^1.1.0
     "@tsconfig/recommended": ^1.0.2
     "@types/jest": ^29.5.3
     "@types/semver": ^7
@@ -32997,6 +33007,7 @@ __metadata:
     semver: ^7.5.4
     turbo: ^1.13.3
     typescript: ~5.1.6
+    zod: ^3.23.8
   languageName: unknown
   linkType: soft
 
